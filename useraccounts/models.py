@@ -158,8 +158,7 @@ class User(AbstractUser):
     objects = CustomUserManager()
 
     def save(self, *args, **kwargs):
-        # Auto-cascade upwards through the geographic hierarchy
-        if self.assigned_ward:
+            if self.assigned_ward:
             if not self.assigned_sub_county:
                 self.assigned_sub_county = self.assigned_ward.sub_county
             if not self.assigned_county:

@@ -29,9 +29,7 @@ import logging
 from django.db import IntegrityError, transaction
 from django.utils.crypto import get_random_string
 from rest_framework.pagination import PageNumberPagination
-
-# ...keep your other existing imports (models, permissions, serializers)
-from .tokens import email_verification_token  # adjust to wherever yours lives
+from .tokens import email_verification_token
 from .permissions import CanManageUsers
 
 logger = logging.getLogger(__name__)
@@ -246,9 +244,6 @@ def logout_user(request):
         {"message": "Logged out successfully."},
         status=status.HTTP_200_OK,
     )
-
-
-# study the second part
 
 
 def scoped_users(actor):

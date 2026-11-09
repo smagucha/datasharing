@@ -10,35 +10,6 @@ from django.core.exceptions import ValidationError
 User = get_user_model()
 
 
-class UserRegistrationSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(
-        write_only=True, min_length=6, style={"input_type": "password"}
-    )
-
-    class Meta:
-        model = User
-        fields = [
-            "email",
-            "password",
-            "first_name",
-            "middle_name",
-            "last_name",
-            "national_id",
-            "phone_number",
-            "role",
-            "assigned_county",
-            "assigned_sub_county",
-            "assigned_ward",
-        ]
-
-    def create(self, validated_data):
-        password = validated_data.pop("password")
-        user = User(**validated_data)
-        user.set_password(password)
-        user.save()
-        return user
-
-
 class ForgotPasswordSerializer(serializers.Serializer):
     email = serializers.EmailField(required=True)
 
@@ -194,16 +165,7 @@ class UserAdminSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         actor = self.context["request"].user
         inst = self.instance
-
-        # if not inst and not attrs.get("password"):
-        #     raise serializers.ValidationError(
-        #         {"password": "Required when creating a user."}
-        #     )
-
         role = attrs.get("role", inst.role if inst else User.Role.REGULAR_USER)
-
-        # If any geography field is sent, it replaces the whole geography;
-        # parents are derived from the most specific one provided.
         if any(f in attrs for f in GEO_FIELDS):
             ward = attrs.get("assigned_ward")
             sub = attrs.get("assigned_sub_county")
