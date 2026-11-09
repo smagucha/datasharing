@@ -17,7 +17,6 @@ from useraccounts.serializers import (
     ForgotPasswordSerializer,
     ResetPasswordSerializer,
     ChangePasswordSerializer,
-    UserRegistrationSerializer,
     PasswordResetSerializer,
     ResendEmailVerificationSerializer,
     VerifyEmailSerializer,
