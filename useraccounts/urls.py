@@ -5,7 +5,8 @@ from rest_framework_simplejwt.views import TokenRefreshView, TokenVerifyView
 
 
 urlpatterns = [
-    path("auth/register/", views.register_user, name="register"),
+    # path("auth/register/", views.register_user, name="register"),
+    path("auth/register/", views.user_list_create, name="register"),
     path("auth/login/", views.login_user, name="login"),
     path("auth/token/refresh/", views.refresh_token, name="token_refresh"),
     path("auth/profile/", views.user_profile, name="profile"),
@@ -24,4 +25,7 @@ urlpatterns = [
     ),
     path("refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("verify-token/", TokenVerifyView.as_view(), name="token_verify"),
+    path("user_detail/<int:pk>/", views.user_detail, name="user_detail"),
+    path("deactivate_user/<int:pk>/", views.user_deactivate, name="deactivate_user"),
+    path("activate_user/<int:pk>/", views.user_activate, name="activate_user"),
 ]

@@ -22,91 +22,22 @@ from useraccounts.serializers import (
     ResendEmailVerificationSerializer,
     VerifyEmailSerializer,
     LoginSerializer,
+    UserAdminSerializer,
 )
 from .tokens import email_verification_token
+import logging
+from django.db import IntegrityError, transaction
+from django.utils.crypto import get_random_string
+from rest_framework.pagination import PageNumberPagination
+
+# ...keep your other existing imports (models, permissions, serializers)
+from .tokens import email_verification_token  # adjust to wherever yours lives
+from .permissions import CanManageUsers
+
+logger = logging.getLogger(__name__)
+MANAGER_PERMISSIONS = [IsAuthenticated, CanManageUsers]
 
 User = get_user_model()
-
-
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-def register_user(request):
-    serializer = UserRegistrationSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
-    email = serializer.validated_data.get("email")
-    raw_password = serializer.validated_data.get("password")
-    existing_errors = {}
-
-    if User.objects.filter(email=email).exists():
-        existing_errors["email"] = "A user with this email address already exists."
-
-    if existing_errors:
-        return Response(
-            {
-                "error": "Registration failed.",
-                "errors": existing_errors,
-                "message": "Please correct the errors and try again.",
-            },
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    try:
-        user = serializer.save()
-    except IntegrityError:
-        return Response(
-            {
-                "error": "Unable to create user. Please try again.",
-                "message": "There was an issue creating your account.",
-            },
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-    user.is_active = False
-    user.must_change_password = True
-    user.save()
-
-    uid = urlsafe_base64_encode(force_bytes(user.pk))
-    token = email_verification_token.make_token(user)
-
-    verification_link = request.build_absolute_uri(
-        f"/useraccounts/account-confirm-email/{uid}/{token}/"
-    )
-    try:
-        send_mail(
-            subject="Verify your email",
-            message=(
-                "An administrator has created an account for you.\n\n"
-                f"Email: {user.email}\n"
-                f"Temporary password: {raw_password}\n\n"
-                f"Verify your email to activate the account:\n{verification_link}\n\n"
-                "Please change your password after your first login."
-            ),
-            from_email=None,
-            recipient_list=[user.email],
-            fail_silently=False,
-        )
-    except Exception as e:
-        user.delete()
-        return Response(
-            {
-                "error": "Failed to send verification email.",
-                "message": "Please try registering again.",
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        )
-
-    return Response(
-        {
-            "message": "User registered successfully. Check your email to verify your account.",
-            "user": {
-                "email": user.email,
-                "role": getattr(user, "role", serializer.validated_data.get("role")),
-            },
-        },
-        status=status.HTTP_201_CREATED,
-    )
-
-
-# {"email":"admin@admin.com", "first_name":"hfdjgh", "middle_name":"djhjdk", "lastname":"hfgk","role":"NATIONAL", "national_id":454616542, "phone_number":"+254741285890", "password": "P@ssWord123
 
 
 @api_view(["GET"])
@@ -250,6 +181,7 @@ def reset_password_confirm(request, uidb64, token):
         {"error": "The reset link is invalid, altered, or has expired."},
         status=status.HTTP_400_BAD_REQUEST,
     )
+    # {"uidb64":"MQ", "token":"dhs0xd-e7d694bba6ad109598b511ce5e9a5df8", "new_password":"P@ssWord123!"}
 
 
 @api_view(["POST"])
@@ -314,3 +246,172 @@ def logout_user(request):
         {"message": "Logged out successfully."},
         status=status.HTTP_200_OK,
     )
+
+
+# study the second part
+
+
+def scoped_users(actor):
+    """Users the actor is allowed to see and touch."""
+    qs = User.objects.select_related(
+        "assigned_county", "assigned_sub_county", "assigned_ward"
+    ).order_by("email")
+
+    if actor.role == User.Role.COUNTY_ADMIN:
+        qs = qs.filter(
+            assigned_county=actor.assigned_county,
+            role__in=User.MANAGEABLE_ROLES[User.Role.COUNTY_ADMIN],
+        )
+    return qs  # National admin: everything
+
+
+def get_scoped_user_or_404(actor, pk):
+    return get_object_or_404(scoped_users(actor), pk=pk)
+
+
+@api_view(["GET", "PUT", "PATCH"])
+@permission_classes(MANAGER_PERMISSIONS)
+def user_detail(request, pk):
+    user = get_scoped_user_or_404(request.user, pk)
+
+    if request.method == "GET":
+        return Response(UserAdminSerializer(user, context={"request": request}).data)
+
+    serializer = UserAdminSerializer(
+        user,
+        data=request.data,
+        partial=(request.method == "PATCH"),
+        context={"request": request},
+    )
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    return Response(serializer.data)
+
+
+@api_view(["POST"])
+@permission_classes(MANAGER_PERMISSIONS)
+def user_deactivate(request, pk):
+    user = get_scoped_user_or_404(request.user, pk)
+
+    if user == request.user:
+        return Response(
+            {"detail": "You can't deactivate yourself."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if user.is_national_admin and not other_active_national_admin_exists(user):
+        return Response(
+            {"detail": "You can't deactivate the last National Admin."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    user.is_active = False
+    user.save(update_fields=["is_active"])
+    return Response(UserAdminSerializer(user, context={"request": request}).data)
+
+
+@api_view(["POST"])
+@permission_classes(MANAGER_PERMISSIONS)
+def user_activate(request, pk):
+    user = get_scoped_user_or_404(request.user, pk)
+    user.is_active = True
+    user.save(update_fields=["is_active"])
+    return Response(UserAdminSerializer(user, context={"request": request}).data)
+
+
+def generate_temp_password(length=12):
+    # Letters + digits + a guaranteed mix, to satisfy typical validators
+    return (
+        get_random_string(length - 3)
+        + get_random_string(1, "ABCDEFGHJKLMNPQRSTUVWXYZ")
+        + get_random_string(1, "abcdefghijkmnopqrstuvwxyz")
+        + get_random_string(1, "23456789")
+    )
+
+
+def send_verification_email(request, user, raw_password):
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = email_verification_token.make_token(user)
+    link = request.build_absolute_uri(
+        f"/useraccounts/account-confirm-email/{uid}/{token}/"
+    )
+    send_mail(
+        subject="Verify your email",
+        message=(
+            "An administrator has created an account for you.\n\n"
+            f"Email: {user.email}\n"
+            f"Temporary password: {raw_password}\n\n"
+            f"Verify your email to activate the account:\n{link}\n\n"
+            "Please change your password after your first login."
+        ),
+        from_email=None,
+        recipient_list=[user.email],
+        fail_silently=False,
+    )
+
+
+@api_view(["GET", "POST"])
+@permission_classes(MANAGER_PERMISSIONS)
+def user_list_create(request):
+    if request.method == "GET":
+        qs = scoped_users(request.user)
+        params = request.query_params
+
+        for param, field in [
+            ("role", "role"),
+            ("county", "assigned_county"),
+            ("sub_county", "assigned_sub_county"),
+            ("ward", "assigned_ward"),
+        ]:
+            if param in params:
+                qs = qs.filter(**{field: params[param]})
+
+        if "is_active" in params:
+            qs = qs.filter(is_active=params["is_active"].lower() in ("true", "1"))
+
+        paginator = PageNumberPagination()
+        page = paginator.paginate_queryset(qs, request)
+        serializer = UserAdminSerializer(page, many=True, context={"request": request})
+        return paginator.get_paginated_response(serializer.data)
+
+    # POST: create user + send verification email
+    data = request.data.copy()
+    raw_password = data.get("password") or generate_temp_password()
+    data["password"] = raw_password
+
+    serializer = UserAdminSerializer(data=data, context={"request": request})
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        # If the email fails, the whole creation rolls back
+        with transaction.atomic():
+            user = serializer.save(is_active=False)  # activated via email link
+            send_verification_email(request, user, raw_password)
+    except IntegrityError:
+        # Race condition: another request took the email / ID / phone first
+        return Response(
+            {
+                "error": "Unable to create user.",
+                "message": "A user with these details already exists.",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    except Exception:
+        logger.exception("Failed to send verification email")
+        return Response(
+            {
+                "error": "Failed to send verification email.",
+                "message": "The user was not created. Please try again.",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return Response(
+        {
+            "message": "User registered successfully. A verification email has been sent.",
+            "user": UserAdminSerializer(user, context={"request": request}).data,
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+# {"email":"admin@admin.com", "first_name":"hfdjgh", "middle_name":"djhjdk", "lastname":"hfgk","role":"NATIONAL", "national_id":454616542, "phone_number":"+254741285890", "password": "P@ssWord123

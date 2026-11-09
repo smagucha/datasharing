@@ -80,6 +80,80 @@ class User(AbstractUser):
     must_change_password = models.BooleanField(default=False)
     USERNAME_FIELD = "email"
     REQUIRED_FIELDS = ["national_id", "phone_number", "first_name", "last_name"]
+    MANAGEABLE_ROLES = {
+        Role.NATIONAL_ADMIN: {
+            Role.NATIONAL_ADMIN,
+            Role.COUNTY_ADMIN,
+            Role.SUB_COUNTY_ADMIN,
+            Role.WARD_ADMIN,
+            Role.REGULAR_USER,
+        },
+        Role.COUNTY_ADMIN: {
+            Role.SUB_COUNTY_ADMIN,
+            Role.WARD_ADMIN,
+            Role.REGULAR_USER,
+        },
+    }
+
+    @property
+    def is_national_admin(self):
+        return self.is_active and self.role == self.Role.NATIONAL_ADMIN
+
+    @property
+    def can_manage_users(self):
+        return self.is_active and self.role in self.MANAGEABLE_ROLES
+
+    @staticmethod
+    def resolve_geography(ward, sub_county, county):
+        """Fill in parents upwards: ward -> sub-county -> county."""
+        if ward:
+            sub_county = sub_county or ward.sub_county
+            county = county or sub_county.county
+        elif sub_county:
+            county = county or sub_county.county
+        return county, sub_county, ward
+
+    @classmethod
+    def validate_hierarchy(cls, role, county, sub_county, ward):
+        R = cls.Role
+        if ward and ward.sub_county_id != sub_county.id:
+            raise ValidationError("Ward does not belong to the selected sub-county.")
+        if sub_county and sub_county.county_id != county.id:
+            raise ValidationError("Sub-county does not belong to the selected county.")
+
+        if role == R.NATIONAL_ADMIN:
+            if county or sub_county or ward:
+                raise ValidationError(
+                    "National admins must not be tied to a geographic area."
+                )
+        elif role == R.COUNTY_ADMIN and not county:
+            raise ValidationError("A county admin must have an assigned county.")
+        elif role == R.SUB_COUNTY_ADMIN and not sub_county:
+            raise ValidationError(
+                "A sub-county admin must have an assigned sub-county."
+            )
+        elif role == R.WARD_ADMIN and not ward:
+            raise ValidationError("A ward admin must have an assigned ward.")
+
+    def can_manage_target(self, target_role, target_county):
+        """May this user hold/create/edit a user with this role in this county?"""
+        allowed = self.MANAGEABLE_ROLES.get(self.role)
+        if not self.is_active or not allowed or target_role not in allowed:
+            return False
+        if self.role == self.Role.NATIONAL_ADMIN:
+            return True
+        return (
+            bool(self.assigned_county_id)
+            and target_county is not None
+            and target_county.id == self.assigned_county_id
+        )
+
+    def clean(self):
+        super().clean()
+        county, sub, ward = self.resolve_geography(
+            self.assigned_ward, self.assigned_sub_county, self.assigned_county
+        )
+        self.validate_hierarchy(self.role, county, sub, ward)
 
     objects = CustomUserManager()
 
