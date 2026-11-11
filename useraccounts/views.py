@@ -13,6 +13,7 @@ from django.core.mail import send_mail
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
+from django.shortcuts import get_object_or_404
 from useraccounts.serializers import (
     ForgotPasswordSerializer,
     ResetPasswordSerializer,
@@ -25,10 +26,11 @@ from useraccounts.serializers import (
 )
 from .tokens import email_verification_token
 import logging
+from django.core import signing
 from django.db import IntegrityError, transaction
 from django.utils.crypto import get_random_string
 from rest_framework.pagination import PageNumberPagination
-from .tokens import email_verification_token
+from .otp import issue_otp, verify_otp, OTPCooldown
 from .permissions import CanManageUsers
 
 logger = logging.getLogger(__name__)
@@ -36,38 +38,110 @@ MANAGER_PERMISSIONS = [IsAuthenticated, CanManageUsers]
 
 User = get_user_model()
 
+CHALLENGE_SALT = "login-otp"
 
-@api_view(["GET"])
-@permission_classes([AllowAny])
-def email_confirm_redirect(request, uidb64, token):
+
+def _mask(email):
+    name, domain = email.split("@")
+    return f"{name[0]}***@{domain}"
+
+
+def _send_otp_email(user, code):
+    send_mail(
+        subject="Your login code",
+        message=f"Your login code is {code}. It expires in 5 minutes.\n"
+        "If this wasn't you, ignore this email.",
+        from_email=None,
+        recipient_list=[user.email],
+        fail_silently=False,
+    )
+
+
+def _challenge_response(user, code):
+    _send_otp_email(user, code)
+    return Response(
+        {
+            "message": "A verification code has been sent to your email.",
+            "challenge": signing.dumps({"uid": user.pk}, salt=CHALLENGE_SALT),
+            "email": _mask(user.email),
+        }
+    )
+
+
+def _user_from_challenge(request):
     try:
-        uid = urlsafe_base64_decode(uidb64).decode()
-        user = User.objects.get(pk=uid)
-    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-        return HttpResponse("Invalid verification link.", status=400)
-
-    if user.is_active:
-        return HttpResponse("Email already verified.", status=200)
-
-    if email_verification_token.check_token(user, token):
-        user.is_active = True
-        user.save()
-        return HttpResponse(
-            "Email verified successfully. You can now log in.",
-            status=200,
+        data = signing.loads(
+            request.data.get("challenge", ""), salt=CHALLENGE_SALT, max_age=600
         )
-    return HttpResponse("Verification link is invalid or expired.", status=400)
-
-
-class LoginView(TokenObtainPairView):
-    serializer_class = LoginSerializer
+    except signing.BadSignature:
+        return None
+    return User.objects.filter(pk=data["uid"], is_active=True).first()
 
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def login_user(request):
-    return LoginView.as_view()(request._request)
-    # {"email":"smagucha@gmail.com", "password":"P@ssWord123"}
+    # Step 1: your serializer validates email + password (wrong password or
+    # inactive account gives the same 401 as before). Tokens are NOT returned.
+    serializer = LoginSerializer(data=request.data, context={"request": request})
+    serializer.is_valid(raise_exception=True)
+    user = serializer.user
+
+    try:
+        code = issue_otp(user)
+    except OTPCooldown:
+        return Response(
+            {"detail": "Please wait a minute before requesting another code."},
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+    try:
+        return _challenge_response(user, code)
+    except Exception:
+        logger.exception("Failed to send OTP email")
+        return Response(
+            {"detail": "Could not send the code. Try again."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def login_verify_otp(request):
+    # Step 2: check the code, then issue tokens
+    user = _user_from_challenge(request)
+    code = str(request.data.get("code", "")).strip()
+    if not user or not verify_otp(user, code):
+        return Response(
+            {"detail": "Invalid or expired code."}, status=status.HTTP_400_BAD_REQUEST
+        )
+
+    refresh = LoginSerializer.get_token(user)  # keeps any custom claims you add
+    return Response(
+        {
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+            "must_change_password": user.must_change_password,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def login_resend_otp(request):
+    user = _user_from_challenge(request)
+    if not user:
+        return Response(
+            {"detail": "Invalid or expired session. Log in again."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        code = issue_otp(user)
+    except OTPCooldown:
+        return Response(
+            {"detail": "Please wait a minute before requesting another code."},
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+    return _challenge_response(user, code)
 
 
 @api_view(["POST"])
@@ -223,6 +297,7 @@ def logout_user(request):
     Accepts a refresh token and blacklists it.
     """
     refresh_token = request.data.get("refresh")
+    print(refresh_token)
 
     if not refresh_token:
         return Response(
@@ -297,9 +372,12 @@ def user_deactivate(request, pk):
             {"detail": "You can't deactivate the last National Admin."},
             status=status.HTTP_400_BAD_REQUEST,
         )
-
     user.is_active = False
-    user.save(update_fields=["is_active"])
+    if not user.has_usable_password():
+        user.set_unusable_password()  # invalidates any outstanding invite link
+        user.save(update_fields=["is_active", "password"])
+    else:
+        user.save(update_fields=["is_active"])
     return Response(UserAdminSerializer(user, context={"request": request}).data)
 
 
@@ -312,35 +390,86 @@ def user_activate(request, pk):
     return Response(UserAdminSerializer(user, context={"request": request}).data)
 
 
-def generate_temp_password(length=12):
-    # Letters + digits + a guaranteed mix, to satisfy typical validators
-    return (
-        get_random_string(length - 3)
-        + get_random_string(1, "ABCDEFGHJKLMNPQRSTUVWXYZ")
-        + get_random_string(1, "abcdefghijkmnopqrstuvwxyz")
-        + get_random_string(1, "23456789")
-    )
-
-
-def send_verification_email(request, user, raw_password):
+def send_invite_email(user):
     uid = urlsafe_base64_encode(force_bytes(user.pk))
-    token = email_verification_token.make_token(user)
-    link = request.build_absolute_uri(
-        f"/useraccounts/account-confirm-email/{uid}/{token}/"
-    )
+    token = default_token_generator.make_token(user)
+    link = f"http://127.0.0.1:8000/useraccounts/auth/set-password/{uid}/{token}/"
     send_mail(
-        subject="Verify your email",
+        subject="You've been invited. Set your password",
         message=(
             "An administrator has created an account for you.\n\n"
-            f"Email: {user.email}\n"
-            f"Temporary password: {raw_password}\n\n"
-            f"Verify your email to activate the account:\n{link}\n\n"
-            "Please change your password after your first login."
+            f"Email: {user.email}\n\n"
+            f"Set your password here to activate it:\n{link}\n\n"
+            "This link expires in 3 days."
         ),
         from_email=None,
         recipient_list=[user.email],
         fail_silently=False,
     )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def set_password(request):
+    uid = str(request.data.get("uid", ""))
+    token = str(request.data.get("token", ""))
+    password = str(request.data.get("password", ""))
+
+    try:
+        user = User.objects.get(pk=urlsafe_base64_decode(uid).decode())
+    except (User.DoesNotExist, ValueError, TypeError, OverflowError):
+        user = None
+
+    # Only accounts that never set a password can use an invite link
+    if (
+        user is None
+        or user.has_usable_password()
+        or not default_token_generator.check_token(user, token)
+    ):
+        return Response(
+            {"detail": "This link is invalid or has expired."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        validate_password(password, user)
+    except DjangoValidationError as e:
+        return Response({"password": e.messages}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(password)
+    user.is_active = True
+    user.must_change_password = False
+    user.save(update_fields=["password", "is_active", "must_change_password"])
+    return Response({"message": "Password set. You can now log in."})
+
+
+#     {
+#   "uid": "Mw",
+#   "token": "cabc12-8f3e...",
+#   "password": "MyOwn!Passw0rd#2026"
+# }
+
+
+@api_view(["POST"])
+@permission_classes(MANAGER_PERMISSIONS)
+def user_resend_invite(request, pk):
+    user = get_scoped_user_or_404(request.user, pk)
+    if user.has_usable_password():
+        return Response(
+            {"detail": "This user has already set a password."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    user.set_unusable_password()  # new random hash, so older links stop working
+    user.save(update_fields=["password"])
+    try:
+        send_invite_email(user)
+    except Exception:
+        logger.exception("Failed to send invite email")
+        return Response(
+            {"detail": "Could not send the email. Try again."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    return Response({"message": "Invite email sent."})
 
 
 @api_view(["GET", "POST"])
@@ -349,7 +478,6 @@ def user_list_create(request):
     if request.method == "GET":
         qs = scoped_users(request.user)
         params = request.query_params
-
         for param, field in [
             ("role", "role"),
             ("county", "assigned_county"),
@@ -366,22 +494,14 @@ def user_list_create(request):
         page = paginator.paginate_queryset(qs, request)
         serializer = UserAdminSerializer(page, many=True, context={"request": request})
         return paginator.get_paginated_response(serializer.data)
-
     # POST: create user + send verification email
-    data = request.data.copy()
-    raw_password = data.get("password") or generate_temp_password()
-    data["password"] = raw_password
-
-    serializer = UserAdminSerializer(data=data, context={"request": request})
+    serializer = UserAdminSerializer(data=request.data, context={"request": request})
     serializer.is_valid(raise_exception=True)
-
     try:
-        # If the email fails, the whole creation rolls back
-        with transaction.atomic():
-            user = serializer.save(is_active=False)  # activated via email link
-            send_verification_email(request, user, raw_password)
+        with transaction.atomic():  # if the email fails, the user is rolled back
+            user = serializer.save(is_active=False)
+            send_invite_email(user)
     except IntegrityError:
-        # Race condition: another request took the email / ID / phone first
         return Response(
             {
                 "error": "Unable to create user.",
@@ -390,18 +510,17 @@ def user_list_create(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
     except Exception:
-        logger.exception("Failed to send verification email")
+        logger.exception("Failed to send invite email")
         return Response(
             {
-                "error": "Failed to send verification email.",
+                "error": "Failed to send invite email.",
                 "message": "The user was not created. Please try again.",
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
-
     return Response(
         {
-            "message": "User registered successfully. A verification email has been sent.",
+            "message": "User created. An invite email has been sent.",
             "user": UserAdminSerializer(user, context={"request": request}).data,
         },
         status=status.HTTP_201_CREATED,
@@ -409,3 +528,6 @@ def user_list_create(request):
 
 
 # {"email":"admin@admin.com", "first_name":"hfdjgh", "middle_name":"djhjdk", "lastname":"hfgk","role":"NATIONAL", "national_id":454616542, "phone_number":"+254741285890", "password": "P@ssWord123
+# {"email":"county@admin.com", "first_name":"sam", "middle_name":"sam", "lastname":"sam","role":"COUNTY", "national_id":123456889, "phone_number":"+254741288710","assigned_county":1, "password": "P@ssWord123"}
+# {"email":"county@admin.com", "first_name":"NICK", "middle_name":"NICK", "lastname":"NICK","role":"SUB_COUNTY", "national_id":216165131, "phone_number":"+254741286610","assigned_county":1, "assigned_sub_county":1}
+# {"email":"sub_county@admin.com", "first_name":"NICK", "middle_name":"NICK", "last_name":"NICK","role":"SUB_COUNTY", "national_id":1111111, "phone_number":"+254777286610","assigned_county":1, "assigned_sub_county":1}

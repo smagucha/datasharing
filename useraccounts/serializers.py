@@ -4,8 +4,10 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError as DjangoValidationError
+from .models import User
 
+GEO_FIELDS = ("assigned_county", "assigned_sub_county", "assigned_ward")
 
 User = get_user_model()
 
@@ -121,14 +123,6 @@ class LoginSerializer(TokenObtainPairSerializer):
         return data
 
 
-from django.contrib.auth.password_validation import validate_password
-from django.core.exceptions import ValidationError as DjangoValidationError
-from rest_framework import serializers
-from .models import User
-
-GEO_FIELDS = ("assigned_county", "assigned_sub_county", "assigned_ward")
-
-
 def other_active_national_admin_exists(user):
     return (
         User.objects.filter(role=User.Role.NATIONAL_ADMIN, is_active=True)
@@ -138,10 +132,6 @@ def other_active_national_admin_exists(user):
 
 
 class UserAdminSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(
-        write_only=True, required=False, validators=[validate_password]
-    )
-
     class Meta:
         model = User
         fields = [
@@ -158,7 +148,6 @@ class UserAdminSerializer(serializers.ModelSerializer):
             "assigned_ward",
             "is_active",
             "must_change_password",
-            "password",
         ]
         read_only_fields = ["must_change_password"]
 
@@ -180,7 +169,6 @@ class UserAdminSerializer(serializers.ModelSerializer):
             ward = sub = county = None
 
         county, sub, ward = User.resolve_geography(ward, sub, county)
-
         try:
             User.validate_hierarchy(role, county, sub, ward)
         except DjangoValidationError as e:
@@ -210,17 +198,7 @@ class UserAdminSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        password = validated_data.pop("password")
-        user = User.objects.create_user(password=password, **validated_data)
-        user.must_change_password = True
-        user.save(update_fields=["must_change_password"])
-        return user
-
-    def update(self, instance, validated_data):
-        password = validated_data.pop("password", None)
-        user = super().update(instance, validated_data)
-        if password:
-            user.set_password(password)
-            user.must_change_password = True
-            user.save(update_fields=["password", "must_change_password"])
+        user = User(**validated_data)
+        user.set_unusable_password()
+        user.save()
         return user

@@ -93,6 +93,11 @@ class User(AbstractUser):
             Role.WARD_ADMIN,
             Role.REGULAR_USER,
         },
+        Role.SUB_COUNTY_ADMIN: {
+            Role.SUB_COUNTY_ADMIN,
+            Role.WARD_ADMIN,
+            Role.REGULAR_USER,
+        },
     }
 
     @property
@@ -158,7 +163,7 @@ class User(AbstractUser):
     objects = CustomUserManager()
 
     def save(self, *args, **kwargs):
-            if self.assigned_ward:
+        if self.assigned_ward:
             if not self.assigned_sub_county:
                 self.assigned_sub_county = self.assigned_ward.sub_county
             if not self.assigned_county:
@@ -170,3 +175,16 @@ class User(AbstractUser):
 
     def __str__(self):
         return f"{self.email} ({self.role})"
+
+
+class OTP(models.Model):
+    class Purpose(models.TextChoices):
+        LOGIN = "LOGIN", "Login"
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="otps")
+    purpose = models.CharField(max_length=20, choices=Purpose.choices)
+    code_hash = models.CharField(max_length=128)  # never store the raw code
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    attempts = models.PositiveSmallIntegerField(default=0)
+    is_used = models.BooleanField(default=False)
